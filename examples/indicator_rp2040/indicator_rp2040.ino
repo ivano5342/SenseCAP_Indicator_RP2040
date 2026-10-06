@@ -1,12 +1,18 @@
 #include <Arduino.h>
+#include "Adafruit_SHT4x.h" //#include <SensirionI2cSht4x.h>
 #include <SensirionI2CSgp40.h>
 #include <SensirionI2cScd4x.h>
+#include <SensirionI2CSen5x.h>
+#include <MiCS6814-I2C.h>
 #include <VOCGasIndexAlgorithm.h>
+#include "SparkFun_BMV080_Arduino_Library.h"
+#include "bme68xLibrary.h"
 #include <Wire.h>
 #include <SPI.h>
 #include <SD.h>
 #include <PacketSerial.h>
-#include "AHT20.h"
+//#include "AHT20.h"
+#include "TCA9548A.h"   // grove 8 channel I2C expander
 
 #define DEBUG 0
 
@@ -23,26 +29,46 @@
 --------------------------------------------------------\n\
 "
 
-AHT20 AHT;
+Adafruit_SHT4x  sht4x = Adafruit_SHT4x(); //AHT20 AHT;
 SensirionI2CSgp40 sgp40;
 SensirionI2cScd4x scd4x;
 VOCGasIndexAlgorithm voc_algorithm;
+MiCS6814 mics;
+SparkFunBMV080 bmv080; // Create an instance of the BMV080 class
+TCA9548A<TwoWire> TCA;  // i2c expander
+Bme68x bme688;
 
 PacketSerial myPacketSerial;
 
 String SDDataString = "";
 
+#define BME688_ADR  0x76  // Adafruit BME688 Breakout defualts to 0x77 (0x76 with pull-down)
+#define BMV080_ADDR 0x57  // SparkFun BMV080 Breakout defaults to 0x57
+
 
 //Type of transfer packet
+#define PKT_TYPE_SENSOR_BMV080_PM1      0xAF
+#define PKT_TYPE_SENSOR_BMV080_PM25     0xB0
+#define PKT_TYPE_SENSOR_BMV080_P10      0xB1
+#define PKT_TYPE_SENSOR_SCD41_CO2       0XB2
+#define PKT_TYPE_SENSOR_SHT41_TEMP      0XB3
+#define PKT_TYPE_SENSOR_SHT41_HUMIDITY  0XB4
+#define PKT_TYPE_SENSOR_TVOC_INDEX      0XB5
+#define PKT_TYPE_SENSOR_SEN55_PM1       0xB6
+#define PKT_TYPE_SENSOR_SEN55_PM2_5     0xB7
+#define PKT_TYPE_SENSOR_SEN55_PM4       0xB8
+#define PKT_TYPE_SENSOR_SEN55_PM10      0xB9
+#define PKT_TYPE_SENSOR_SEN55_VOCINDEX  0xBA
+#define PKT_TYPE_SENSOR_SEN55_NOX       0xBB
+#define PKT_TYPE_SENSOR_SEN55_TEMP      0xBC
+#define PKT_TYPE_SENSOR_SEN55_HUMIDITY  0xBD
 
-#define PKT_TYPE_SENSOR_SCD41_CO2 0XB2
-#define PKT_TYPE_SENSOR_SHT41_TEMP 0XB3
-#define PKT_TYPE_SENSOR_SHT41_HUMIDITY 0XB4
-#define PKT_TYPE_SENSOR_TVOC_INDEX 0XB5
-#define PKT_TYPE_CMD_COLLECT_INTERVAL 0xA0
-#define PKT_TYPE_CMD_BEEP_ON 0xA1
-#define PKT_TYPE_CMD_SHUTDOWN 0xA3
+#define PKT_TYPE_CMD_COLLECT_INTERVAL   0xA0
+#define PKT_TYPE_CMD_BEEP_ON            0xA1
+#define PKT_TYPE_CMD_SHUTDOWN           0xA3
 
+//BME688 defines
+#define MEAS_DUR 140
 
 
 // sensor data send to  esp32
@@ -93,6 +119,9 @@ void sensor_power_off(void) {
   digitalWrite(18, LOW);
 }
 
+float bmv_pm10 = 0.0;
+float bmv_pm25 = 0.0;
+float bmv_pm1 = 0.0;
 
 float temperature = 0.0;
 float humidity = 0.0;
@@ -103,35 +132,45 @@ uint16_t defaultCompenstaionT = 0x6666;
 uint16_t compensationRh = defaultCompenstaionRh;
 uint16_t compensationT = defaultCompenstaionT;
 
+bool mics_connected = false;
+bool bme688_connected = false;
+bool bmv080_connected = false;
+
+
+
 /************************ aht  temp & humidity ****************************/
 
-void sensor_aht_init(void) {
-  AHT.begin();
+void sensor_sht4x_init(void) {
+  sht4x.begin();//, SHT41_I2C_ADDR_44);
+  sht4x.setPrecision(SHT4X_HIGH_PRECISION);
+  sht4x.setHeater(SHT4X_NO_HEATER);
+  //sht4x.softReset();
 }
 
-void sensor_aht_get(void) {
+void sensor_sht4x_get(void) {
 
-  float humi, temp;
+  sensors_event_t temp, humi;
 
-  int ret = AHT.getSensor(&humi, &temp);
+  int ret = sht4x.getEvent(&humi, &temp);
   if (ret)  // GET DATA OK
   {
+    temperature = temp.temperature;
+    humidity = humi.relative_humidity;// * 100;
     Serial.print("humidity: ");
-    Serial.print(humi * 100);
+    Serial.print(humidity);
     Serial.print("%\t temerature: ");
-    Serial.println(temp);
-    temperature = temp;
-    humidity = humi * 100;
+    Serial.println((temperature*1.8) +32);
     compensationT = static_cast<uint16_t>((temperature + 45) * 65535 / 175);
     compensationRh = static_cast<uint16_t>(humidity * 65535 / 100);
-  } else  // GET DATA FAIL
+  } 
+  else  // GET DATA FAIL
   {
-    Serial.println("GET DATA FROM AHT20 FAIL");
+    Serial.println("GET DATA FROM SHT41 FAIL");
     compensationRh = defaultCompenstaionRh;
     compensationT = defaultCompenstaionT;
   }
 
-  SDDataString += "aht20,";
+  SDDataString += "sht41,";
   if (ret) {
     SDDataString += String(temperature);
     SDDataString += ',';
@@ -383,7 +422,15 @@ void setup() {
 
   Wire.setSDA(20);
   Wire.setSCL(21);
-  Wire.begin();
+  TCA.begin(Wire);//Wire.begin();
+  TCA.openChannel(TCA_CHANNEL_0); //TCA.closeChannel(TCA_CHANNEL_0);
+  TCA.openChannel(TCA_CHANNEL_1); //TCA.closeChannel(TCA_CHANNEL_1);
+  TCA.openChannel(TCA_CHANNEL_2); //TCA.closeChannel(TCA_CHANNEL_2);
+  TCA.openChannel(TCA_CHANNEL_3); //TCA.closeChannel(TCA_CHANNEL_3);
+  TCA.openChannel(TCA_CHANNEL_4); //TCA.closeChannel(TCA_CHANNEL_4);
+  TCA.openChannel(TCA_CHANNEL_5); //TCA.closeChannel(TCA_CHANNEL_5);
+  TCA.openChannel(TCA_CHANNEL_6); //TCA.closeChannel(TCA_CHANNEL_6);
+  TCA.openChannel(TCA_CHANNEL_7); //TCA.closeChannel(TCA_CHANNEL_7); 
 
   const int chipSelect = 13;
   SPI1.setSCK(10);
@@ -397,9 +444,49 @@ void setup() {
     sd_init_flag = 1;
   }
 
-  sensor_aht_init();
+  sensor_sht4x_init();
   sensor_sgp40_init();
   sensor_scd4x_init();
+  bme688.begin(BME688_ADR, Wire);
+  {
+    bme688_connected = true;
+    /* Setting the default heater profile configuration */
+    bme688.setTPH();
+    /* Heater temperature in degree Celsius as per the suggested heater profile
+    */
+    uint16_t tempProf[10] = {320, 100, 100, 100, 200, 200, 200, 320, 320, 320};
+    /* Multiplier to the shared heater duration */
+    uint16_t mulProf[10] = {5, 2, 10, 30, 5, 5, 5, 5, 5, 5};
+    /* Shared heating duration in milliseconds */
+    uint16_t sharedHeatrDur =
+        MEAS_DUR - (bme688.getMeasDur(BME68X_PARALLEL_MODE) / INT64_C(1000));
+
+    bme688.setHeaterProf(tempProf, mulProf, sharedHeatrDur, 10);
+
+    /* Parallel mode of sensor operation */
+    bme688.setOpMode(BME68X_PARALLEL_MODE);
+  }
+  if (bmv080.begin(BMV080_ADDR, Wire) == true)
+  {
+    bmv080_connected = true;
+    Serial.println("BMV080 found!");
+    bmv080.init();
+    /* Set the sensor mode to continuous mode */
+    if (bmv080.setMode(SF_BMV080_MODE_CONTINUOUS) == true)
+    {
+        Serial.println("BMV080 set to continuous mode");
+    }
+    else
+    {
+        Serial.println("Error setting BMV080 mode");
+    }
+  }
+
+  mics_connected = 0;//mics.begin(0x08);//the default I2C address of the slave is 0x04
+  if (mics_connected)
+  {
+    mics.powerOn();
+  }
 
   int32_t index_offset;
   int32_t learning_time_offset_hours;
@@ -433,6 +520,13 @@ void setup() {
   Serial.printf(SENSECAP, VERSION);
 }
 
+int val = 0;
+String logHeader;
+uint8_t lastMeasindex = 0;
+bme68xData sensorData;
+uint32_t lastLogged = 0;
+
+
 void loop() {
   if (i > 500) {
     i = 0;
@@ -444,9 +538,136 @@ void loop() {
     SDDataString += ',';
 
     cnt++;
-    sensor_aht_get();
+    sensor_sht4x_get();
     sensor_sgp40_get();
     sensor_scd4x_get();
+
+    /* Control loop for data acquisition - checks if the data is available */
+    uint8_t nFieldsLeft = 0;
+    int16_t indexDiff;
+    bool newLogdata = false;
+    if ((millis() - lastLogged) >= MEAS_DUR) {
+
+      lastLogged = millis();
+      if (bme688.fetchData()) {
+        do {
+          nFieldsLeft = bme688.getData(sensorData);
+          /* Check if new data is received */
+          if (sensorData.status & BME68X_NEW_DATA_MSK) {
+            ///* Inspect miss of data index */
+            //indexDiff =
+            //    (int16_t)sensorData.meas_index - (int16_t)lastMeasindex;
+            //if (indexDiff > 1) {
+//
+            //  Serial.println("Skip nfield:" + String(nFieldsLeft) +
+            //                 ", DIFF:" + String(indexDiff) +
+            //                 ", MI:" + String(sensorData.meas_index) +
+            //                 ", LMI:" + String(lastMeasindex) +
+            //                 ", S:" + String(sensorData.status, HEX));
+            //  continue;//panicLeds();
+            //}
+            //lastMeasindex = sensorData.meas_index;
+            
+            logHeader = "bme688  ";
+            //logHeader += millis();
+            //logHeader += ":";
+            logHeader += nFieldsLeft;
+            logHeader += ":";
+            logHeader += ((sensorData.temperature*1.8)+32);
+            logHeader += ",";
+            logHeader += sensorData.pressure;
+            logHeader += ",";
+            logHeader += sensorData.humidity;
+            logHeader += ",";
+            logHeader += sensorData.gas_resistance;
+            logHeader += ",";
+            logHeader += sensorData.gas_index;
+            logHeader += ",";
+            logHeader += sensorData.meas_index;
+            logHeader += ",";
+            logHeader += sensorData.idac;
+            logHeader += ",";
+            logHeader += String(sensorData.status, HEX);
+            logHeader += ",";
+            logHeader += sensorData.status & BME68X_GASM_VALID_MSK;
+            logHeader += ",";
+            logHeader += sensorData.status & BME68X_HEAT_STAB_MSK;
+            logHeader += "\r\n";
+            Serial.print(logHeader);
+            newLogdata = true;
+          }
+        } while (nFieldsLeft);
+      }
+    }
+
+    if (bmv080_connected && bmv080.readSensor())
+    {
+        char buf[20];
+        bmv_pm10 = bmv080.PM10();
+        bmv_pm25 = bmv080.PM25();
+        bmv_pm1 = bmv080.PM1();
+        dtostrf(bmv_pm10, 4, 1, buf);
+        Serial.print("PM10: ");
+        Serial.print(buf);
+        Serial.print("\t");
+        Serial.print("PM2.5: ");
+        Serial.print(bmv_pm25);
+        Serial.print("\t");
+        Serial.print("PM1: ");
+        Serial.print(bmv_pm1);
+
+        sensor_data_send(PKT_TYPE_SENSOR_BMV080_PM25, (float)bmv_pm25);  //todo
+
+        if (bmv080.isObstructed() == true)
+        {
+            Serial.print("\tObstructed");
+        }
+
+        Serial.println();
+    }
+    if (mics_connected)
+    {
+      val = mics.measureCO();
+      if (val > 999) val = 999;
+      Serial.print("CO:");
+      Serial.print(val);
+      Serial.print("\t");
+      val = mics.measureNO2();
+      if (val > 999) val = 999;
+      Serial.print("NO2:");
+      Serial.print(val);
+      Serial.print("\t");
+      val = mics.measureC2H5OH();
+      if (val > 999) val = 999;
+      Serial.print("C2H5CH:");
+      Serial.print(val);
+      Serial.print("\t");
+      val = mics.measureNH3();
+      if (val > 999) val = 999;
+      Serial.print("NH3:");
+      Serial.print(val);
+      Serial.print("\t");
+      val = mics.measureC3H8();
+      if (val > 999) val = 999;
+      Serial.print("C3H8:");
+      Serial.print(val);
+      Serial.print("\t");
+      val = mics.measureC4H10();
+      if (val > 999) val = 999;
+      Serial.print("C4H10:");
+      Serial.print(val);
+      Serial.print("\t");
+      val = mics.measureCH4();
+      if (val > 999) val = 999;
+      Serial.print("C4:");
+      Serial.print(val);
+      Serial.print("\t");
+      val = mics.measureH2();
+      if (val > 999) val = 999;
+      Serial.print("H2:");
+      Serial.print(val);
+      Serial.println("\t");
+    }
     grove_adc_get();
 
     if (sd_init_flag) {
